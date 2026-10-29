@@ -412,7 +412,7 @@ def assign_params(func, namespace):
 		sig = inspect.signature(func)
 		params = sig.parameters.keys()
 	except AttributeError:
-		spec = inspect.getargspec(func)
+		spec = inspect.getfullargspec(func)
 		params = spec.args
 	call_ns = {
 		k: namespace[k]

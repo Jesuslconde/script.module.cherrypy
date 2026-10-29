@@ -1,25 +1,27 @@
 """Pytest fixtures and other helpers for doing testing by end-users."""
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
-
-from contextlib import closing
 import errno
+import http.client
 import socket
 import threading
 import time
+from contextlib import closing, contextmanager
 
 import pytest
-from six.moves import http_client
 
 import cheroot.server
-from cheroot.test import webtest
 import cheroot.wsgi
+from cheroot.test import webtest
+
 
 EPHEMERAL_PORT = 0
 NO_INTERFACE = None  # Using this or '' will cause an exception
 ANY_INTERFACE_IPV4 = '0.0.0.0'
 ANY_INTERFACE_IPV6 = '::'
+
+# We use special exit code to indicate success, rather than normal zero, so
+# the test doesn't acidentally pass:
+SUCCESSFUL_SUBPROCESS_EXIT = 23
 
 config = {
     cheroot.wsgi.Server: {
@@ -33,7 +35,8 @@ config = {
 }
 
 
-def cheroot_server(server_factory):
+@contextmanager
+def cheroot_server(server_factory):  # noqa: WPS210
     """Set up and tear down a Cheroot server instance."""
     conf = config[server_factory].copy()
     bind_port = conf.pop('bind_addr')[-1]
@@ -43,57 +46,94 @@ def cheroot_server(server_factory):
             actual_bind_addr = (interface, bind_port)
             httpserver = server_factory(  # create it
                 bind_addr=actual_bind_addr,
-                **conf
+                **conf,
             )
         except OSError:
             pass
         else:
             break
 
-    threading.Thread(target=httpserver.safe_start).start()  # spawn it
+    httpserver.shutdown_timeout = 0  # Speed-up tests teardown
+
+    # FIXME: Expose this thread through a fixture so that it
+    # FIXME: could be awaited in tests.
+    server_thread = threading.Thread(target=httpserver.safe_start)
+    server_thread.start()  # spawn it
     while not httpserver.ready:  # wait until fully initialized and bound
         time.sleep(0.1)
 
-    yield httpserver
+    try:
+        yield server_thread, httpserver
+    finally:
+        httpserver.stop()  # destroy it
+        server_thread.join()  # wait for the thread to be turn down
 
-    httpserver.stop()  # destroy it
+
+@pytest.fixture
+def thread_and_wsgi_server():
+    """Set up and tear down a Cheroot WSGI server instance.
+
+    This emits a tuple of a thread and a server instance.
+    """
+    with cheroot_server(cheroot.wsgi.Server) as (server_thread, srv):
+        yield server_thread, srv
 
 
-@pytest.fixture(scope='module')
-def wsgi_server():
+@pytest.fixture
+def thread_and_native_server():
+    """Set up and tear down a Cheroot HTTP server instance.
+
+    This emits a tuple of a thread and a server instance.
+    """
+    with cheroot_server(cheroot.server.HTTPServer) as (server_thread, srv):
+        yield server_thread, srv
+
+
+@pytest.fixture
+def wsgi_server(thread_and_wsgi_server):
     """Set up and tear down a Cheroot WSGI server instance."""
-    for srv in cheroot_server(cheroot.wsgi.Server):
-        yield srv
+    _server_thread, srv = thread_and_wsgi_server
+    return srv
 
 
-@pytest.fixture(scope='module')
-def native_server():
+@pytest.fixture
+def native_server(thread_and_native_server):
     """Set up and tear down a Cheroot HTTP server instance."""
-    for srv in cheroot_server(cheroot.server.HTTPServer):
-        yield srv
+    _server_thread, srv = thread_and_native_server
+    return srv
 
 
 class _TestClient:
     def __init__(self, server):
-        self._interface, self._host, self._port = _get_conn_data(server)
-        self._http_connection = self.get_connection()
+        self._interface, self._host, self._port = _get_conn_data(
+            server.bind_addr,
+        )
         self.server_instance = server
+        self._http_connection = self.get_connection()
 
     def get_connection(self):
-        name = '{interface}:{port}'.format(
-            interface=self._interface,
-            port=self._port,
+        name = f'{self._interface}:{self._port}'
+        conn_cls = (
+            http.client.HTTPConnection
+            if self.server_instance.ssl_adapter is None
+            else http.client.HTTPSConnection
         )
-        return http_client.HTTPConnection(name)
+        return conn_cls(name)
 
-    def request(
-        self, uri, method='GET', headers=None, http_conn=None,
+    def request(  # pylint: disable=too-many-positional-arguments
+        self,
+        uri,
+        method='GET',
+        headers=None,
+        http_conn=None,
         protocol='HTTP/1.1',
     ):
         return webtest.openURL(
-            uri, method=method,
+            uri,
+            method=method,
             headers=headers,
-            host=self._host, port=self._port,
+            host=self._host,
+            port=self._port,
             http_conn=http_conn or self._http_connection,
             protocol=protocol,
         )
@@ -112,9 +152,7 @@ def _probe_ipv6_sock(interface):
     try:
         with closing(socket.socket(family=socket.AF_INET6)) as sock:
             sock.bind((interface, 0))
-    except (OSError, socket.error) as sock_err:
-        # In Python 3 socket.error is an alias for OSError
-        # In Python 2 socket.error is a subclass of IOError
+    except OSError as sock_err:
         if sock_err.errno != errno.EADDRNOTAVAIL:
             raise
     else:
@@ -123,11 +161,11 @@ def _probe_ipv6_sock(interface):
     return False
 
 
-def _get_conn_data(server):
-    if isinstance(server.bind_addr, tuple):
-        host, port = server.bind_addr
+def _get_conn_data(bind_addr):
+    if isinstance(bind_addr, tuple):
+        host, port = bind_addr
     else:
-        host, port = server.bind_addr, 0
+        host, port = bind_addr, 0
 
     interface = webtest.interface(host)
 

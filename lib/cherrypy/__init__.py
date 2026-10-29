@@ -57,9 +57,11 @@ These API's are described in the `CherryPy specification
 """
 
 try:
-    import pkg_resources
+    import importlib.metadata as importlib_metadata
 except ImportError:
-    pass
+    # fall back for python <= 3.7
+    # This try/except can be removed with py <= 3.7 support
+    import importlib_metadata
 
 from threading import local as _local
 
@@ -108,10 +110,7 @@ __import__('cherrypy._cprequest')
 tree = _cptree.Tree()
 
 
-try:
-    __version__ = pkg_resources.require('cherrypy')[0].version
-except Exception:
-    __version__ = 'unknown'
+__version__ = '18.10.0'
 
 
 engine.listeners['before_request'] = set()
@@ -181,24 +180,28 @@ def quickstart(root=None, script_name='', config=None):
 class _Serving(_local):
     """An interface for registering request and response objects.
 
-    Rather than have a separate "thread local" object for the request and
-    the response, this class works as a single threadlocal container for
-    both objects (and any others which developers wish to define). In this
-    way, we can easily dump those objects when we stop/start a new HTTP
-    conversation, yet still refer to them as module-level globals in a
-    thread-safe way.
+    Rather than have a separate "thread local" object for the request
+    and the response, this class works as a single threadlocal container
+    for both objects (and any others which developers wish to define).
+    In this way, we can easily dump those objects when we stop/start a
+    new HTTP conversation, yet still refer to them as module-level
+    globals in a thread-safe way.
     """
 
     request = _cprequest.Request(_httputil.Host('127.0.0.1', 80),
                                  _httputil.Host('127.0.0.1', 1111))
+    """The request object for the current thread.
+
+    In the main thread, and any threads which are not receiving HTTP
+    requests, this is None.
     """
-    The request object for the current thread. In the main thread,
-    and any threads which are not receiving HTTP requests, this is None."""
 
     response = _cprequest.Response()
+    """The response object for the current thread.
+
+    In the main thread, and any threads which are not receiving HTTP
+    requests, this is None.
     """
-    The response object for the current thread. In the main thread,
-    and any threads which are not receiving HTTP requests, this is None."""
 
     def load(self, request, response):
         self.request = request
@@ -316,8 +319,8 @@ class _GlobalLogManager(_cplogging.LogManager):
     def __call__(self, *args, **kwargs):
         """Log the given message to the app.log or global log.
 
-        Log the given message to the app.log or global
-        log as appropriate.
+        Log the given message to the app.log or global log as
+        appropriate.
         """
         # Do NOT use try/except here. See
         # https://github.com/cherrypy/cherrypy/issues/945
@@ -330,8 +333,8 @@ class _GlobalLogManager(_cplogging.LogManager):
     def access(self):
         """Log an access message to the app.log or global log.
 
-        Log the given message to the app.log or global
-        log as appropriate.
+        Log the given message to the app.log or global log as
+        appropriate.
         """
         try:
             return request.app.log.access()

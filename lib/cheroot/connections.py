@@ -1,27 +1,25 @@
 """Utilities to manage open connections."""
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
-
 import io
 import os
+import selectors
 import socket
 import threading
 import time
+from contextlib import suppress
 
 from . import errors
-from ._compat import selectors
-from ._compat import suppress
+from ._compat import IS_WINDOWS
 from .makefile import MakeFile
 
-import six
 
 try:
     import fcntl
 except ImportError:
     try:
-        from ctypes import windll, WinError
         import ctypes.wintypes
+        from ctypes import WinError, windll
+
         _SetHandleInformation = windll.kernel32.SetHandleInformation
         _SetHandleInformation.argtypes = [
             ctypes.wintypes.HANDLE,
@@ -30,18 +28,20 @@ except ImportError:
         ]
         _SetHandleInformation.restype = ctypes.wintypes.BOOL
     except ImportError:
+
         def prevent_socket_inheritance(sock):
             """Stub inheritance prevention.
 
             Dummy function, since neither fcntl nor ctypes are available.
             """
-            pass
     else:
+
         def prevent_socket_inheritance(sock):
             """Mark the given socket fd as non-inheritable (Windows)."""
             if not _SetHandleInformation(sock.fileno(), 1, 0):
                 raise WinError()
 else:
+
     def prevent_socket_inheritance(sock):
         """Mark the given socket fd as non-inheritable (POSIX)."""
         fd = sock.fileno()
@@ -133,7 +133,8 @@ class ConnectionManager:
 
         self._selector.register(
             server.socket.fileno(),
-            selectors.EVENT_READ, data=server,
+            selectors.EVENT_READ,
+            data=server,
         )
 
     def put(self, conn):
@@ -149,20 +150,23 @@ class ConnectionManager:
             self.server.process_conn(conn)
         else:
             self._selector.register(
-                conn.socket.fileno(), selectors.EVENT_READ, data=conn,
+                conn.socket.fileno(),
+                selectors.EVENT_READ,
+                data=conn,
             )
 
-    def _expire(self):
-        """Expire least recently used connections.
+    def _expire(self, threshold):
+        r"""Expire least recently used connections.
 
-        This happens if there are either too many open connections, or if the
-        connections have been timed out.
+        :param threshold: Connections that have not been used within this \
+                          duration (in seconds), are considered expired and \
+                          are closed and removed.
+        :type threshold: float
 
         This should be called periodically.
         """
         # find any connections still registered with the selector
         # that have not been active recently enough.
-        threshold = time.time() - self.server.timeout
         timed_out_connections = [
             (sock_fd, conn)
             for (sock_fd, conn) in self._selector.connections
@@ -203,20 +207,47 @@ class ConnectionManager:
             self._serving = False
 
     def _run(self, expiration_interval):
+        r"""Run connection handler loop until stop was requested.
+
+        :param expiration_interval: Interval, in seconds, at which \
+                                    connections will be checked for \
+                                    expiration.
+        :type expiration_interval: float
+
+        Use ``expiration_interval`` as ``select()`` timeout
+        to assure expired connections are closed in time.
+
+        On Windows cap the timeout to 0.05 seconds
+        as ``select()`` does not return when a socket is ready.
+        """
         last_expiration_check = time.time()
+        if IS_WINDOWS:
+            # 0.05 seconds are used as an empirically obtained balance between
+            # max connection delay and idle system load. Benchmarks show a
+            # mean processing time per connection of ~0.03 seconds on Linux
+            # and with 0.01 seconds timeout on Windows:
+            # https://github.com/cherrypy/cheroot/pull/352
+            # While this highly depends on system and hardware, 0.05 seconds
+            # max delay should hence usually not significantly increase the
+            # mean time/delay per connection, but significantly reduce idle
+            # system load by reducing socket loops to 1/5 with 0.01 seconds.
+            select_timeout = min(expiration_interval, 0.05)
+        else:
+            select_timeout = expiration_interval
 
         while not self._stop_requested:
             try:
-                active_list = self._selector.select(timeout=0.01)
+                active_list = self._selector.select(timeout=select_timeout)
             except OSError:
                 self._remove_invalid_sockets()
                 continue
 
-            for (sock_fd, conn) in active_list:
+            for sock_fd, conn in active_list:
                 if conn is self.server:
                     # New connection
                     new_conn = self._from_server_socket(self.server.socket)
-                    self.server.process_conn(new_conn)
+                    if new_conn is not None:
+                        self.server.process_conn(new_conn)
                 else:
                     # unregister connection from the selector until the server
                     # has read from it and returned it via put()
@@ -225,7 +256,7 @@ class ConnectionManager:
 
             now = time.time()
             if (now - last_expiration_check) > expiration_interval:
-                self._expire()
+                self._expire(threshold=now - self.server.timeout)
                 last_expiration_check = now
 
     def _remove_invalid_sockets(self):
@@ -250,8 +281,7 @@ class ConnectionManager:
             # One of the reason on why a socket could cause an error
             # is that the socket is already closed, ignore the
             # socket error if we try to close it at this point.
-            # This is equivalent to OSError in Py3
-            with suppress(socket.error):
+            with suppress(OSError):
                 conn.close()
 
     def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
@@ -269,7 +299,20 @@ class ConnectionManager:
             if self.server.ssl_adapter is not None:
                 try:
                     s, ssl_env = self.server.ssl_adapter.wrap(s)
-                except errors.NoSSLError:
+                except errors.FatalSSLAlert as tls_connection_drop_error:
+                    self.server.error_log(
+                        f'Client {addr!s} lost — peer dropped the TLS '
+                        'connection suddenly, during handshake: '
+                        f'{tls_connection_drop_error!s}',
+                    )
+                    return None
+                except errors.NoSSLError as http_over_https_err:
+                    self.server.error_log(
+                        f'Client {addr!s} attempted to speak plain HTTP into '
+                        'a TCP connection configured for TLS-only traffic — '
+                        'trying to send back a plain HTTP error response: '
+                        f'{http_over_https_err!s}',
+                    )
                     msg = (
                         'The client sent a plain HTTP request, but '
                         'this server only speaks HTTPS on this port.'
@@ -281,16 +324,13 @@ class ConnectionManager:
                         msg,
                     ]
 
-                    sock_to_make = s if not six.PY2 else s._sock
-                    wfile = mf(sock_to_make, 'wb', io.DEFAULT_BUFFER_SIZE)
+                    wfile = mf(s, 'wb', io.DEFAULT_BUFFER_SIZE)
                     try:
                         wfile.write(''.join(buf).encode('ISO-8859-1'))
-                    except socket.error as ex:
+                    except OSError as ex:
                         if ex.args[0] not in errors.socket_errors_to_ignore:
                             raise
-                    return
-                if not s:
-                    return
+                    return None
                 mf = self.server.ssl_adapter.makefile
                 # Re-apply our timeout since we may have a new socket object
                 if hasattr(s, 'settimeout'):
@@ -298,10 +338,7 @@ class ConnectionManager:
 
             conn = self.server.ConnectionClass(self.server, s, mf)
 
-            if not isinstance(
-                    self.server.bind_addr,
-                    (six.text_type, six.binary_type),
-            ):
+            if not isinstance(self.server.bind_addr, (str, bytes)):
                 # optional values
                 # Until we do DNS lookups, omit REMOTE_HOST
                 if addr is None:  # sometimes this can happen
@@ -322,8 +359,8 @@ class ConnectionManager:
             # The only reason for the timeout in start() is so we can
             # notice keyboard interrupts on Win32, which don't interrupt
             # accept() by default
-            return
-        except socket.error as ex:
+            return None
+        except OSError as ex:
             if self.server.stats['Enabled']:
                 self.server.stats['Socket Errors'] += 1
             if ex.args[0] in errors.socket_error_eintr:
@@ -333,20 +370,20 @@ class ConnectionManager:
                 # will then go ahead and poll for and handle the signal
                 # elsewhere. See
                 # https://github.com/cherrypy/cherrypy/issues/707.
-                return
+                return None
             if ex.args[0] in errors.socket_errors_nonblocking:
                 # Just try again. See
                 # https://github.com/cherrypy/cherrypy/issues/479.
-                return
+                return None
             if ex.args[0] in errors.socket_errors_to_ignore:
                 # Our socket was closed.
                 # See https://github.com/cherrypy/cherrypy/issues/686.
-                return
+                return None
             raise
 
     def close(self):
         """Close all monitored connections."""
-        for (_, conn) in self._selector.connections:
+        for _, conn in self._selector.connections:
             if conn is not self.server:  # server closes its own socket
                 conn.close()
         self._selector.close()

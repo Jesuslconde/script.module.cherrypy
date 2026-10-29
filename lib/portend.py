@@ -13,6 +13,7 @@ import sys
 import itertools
 import contextlib
 import collections
+import collections.abc
 import platform
 
 from tempora import timing
@@ -57,7 +58,7 @@ class Checker(object):
 
 		>>> Checker().assert_free('::', free_port)
 		"""
-		if port is None and isinstance(host, collections.Sequence):
+		if port is None and isinstance(host, collections.abc.Sequence):
 			host, port = host[:2]
 		if platform.system() == 'Windows':
 			host = client_host(host)

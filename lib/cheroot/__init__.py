@@ -1,6 +1,9 @@
 """High-performance, pure-Python HTTP server used by CherryPy."""
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
+from importlib import metadata
 
-__version__ = '6.4.0'
+
+try:
+    __version__ = metadata.version('cheroot')
+except Exception:
+    __version__ = 'unknown'
